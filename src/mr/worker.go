@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +20,16 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+const waitTime = time.Second * 2
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,41 +41,52 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	for {
+		reply := GetJob()
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+		switch reply.Jtype {
+		case QUIT:
+			fmt.Println("Quiting...")
+			return
+		case WAIT:
+			fmt.Println("Waiting...")
+			time.Sleep(waitTime)
+		case MAP:
+			fmt.Printf("Get a map job #%v. Executing...\n", reply.Jid)
+			if execMap(reply, mapf) {
+				finishJob(reply)
+			} else {
+				fmt.Println("Exec map failed.")
+				return
+			}
+		case REDUCE:
+			fmt.Printf("Get a reduce job #%v. Executing...\n", reply.Jid)
+			if execReduce(reply, reducef) {
+				finishJob(reply)
+			} else {
+				fmt.Println("Exec reduce failed.")
+				return
+			}
+		}
+		// time.Sleep(waitTime)
+	}
 
 }
 
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+// get job from master
+func GetJob() JobReply {
+	args := JobArgs{}
+	reply := JobReply{}
+	// reply.Jfiles = []string{}
+	if !call("Master.GetJob", &args, &reply) {
+		reply.Jtype = QUIT
+	}
+	return reply
 }
 
 //
@@ -82,4 +110,101 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func execMap(reply JobReply, mapf func(string, string) []KeyValue) bool {
+	//
+	// read each input file,
+	// pass it to Map,
+	// accumulate the intermediate Map output.
+	//
+	groups := make([][]KeyValue, reply.Jnum)
+	for _, filename := range reply.Jfiles {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+			return false
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+			return false
+		}
+		file.Close()
+		kva := mapf(filename, string(content))
+		for _, kv := range kva {
+			i := ihash(kv.Key) % reply.Jnum
+			groups[i] = append(groups[i], kv)
+		}
+	}
+
+	for i, group := range groups {
+		file, _ := ioutil.TempFile("", "map-tmp-")
+
+		tmpPath := file.Name()
+		targetPath := "./mr-" + strconv.Itoa(reply.Jid) + "-" + strconv.Itoa(i) + ".tmp"
+		enc := json.NewEncoder(file)
+		for _, kv := range group {
+			enc.Encode(&kv)
+		}
+		file.Close()
+		os.Rename(tmpPath, targetPath)
+	}
+	return true
+}
+
+func finishJob(reply JobReply) {
+	emptyReply := EmptyReply{}
+	call("Master.FinishJob", &reply, &emptyReply)
+}
+
+func execReduce(reply JobReply, reducef func(string, []string) string) bool {
+	intermediate := []KeyValue{}
+	for _, fileName := range reply.Jfiles {
+		file, err := os.Open(fileName)
+		if err != nil {
+			return false
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	oname := "mr-out-" + strconv.Itoa(reply.Jid) + ".tmp"
+	ofile, err := os.Create(oname)
+	if err != nil {
+		return false
+	}
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+	return true
 }
