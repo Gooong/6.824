@@ -2,3 +2,5 @@ pkg/
 api.key
 *-handin.tar.gz
 *tmp
+*.DS_Store
+*.icloud
