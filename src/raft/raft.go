@@ -55,7 +55,7 @@ const (
 	TimeoutUpperMS      = 800
 	HeartBeatIntervalMS = 200
 	LoopCheckIntervalMS = 50
-	enableLog           = false
+	enableLog           = true
 )
 
 type leader struct {
@@ -90,13 +90,12 @@ type Raft struct {
 	lastTime        time.Time
 	timeoutInterval time.Duration
 
-	nserver       int
-	commitIndex   int
-	applyCh       chan ApplyMsg
-	applyChBuffer chan ApplyMsg
-	lastApplied   int
-	status        int
-	leaderStatus  leader
+	nserver      int
+	commitIndex  int
+	applyCh      chan ApplyMsg
+	lastApplied  int
+	status       int
+	leaderStatus leader
 }
 
 // return currentTerm and whether this server
@@ -207,7 +206,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if rf.status == FOLLOWER {
 		lastLog := rf.logs[len(rf.logs)-1]
 
-		if rf.votedFor != -1 {
+		if rf.votedFor != -1 && rf.votedFor != args.CandidateID {
 			rf.printLog("Reject the vote of server", args.CandidateID, "because I have already voted.")
 		} else if lastLog.Term > args.LastLogTerm || (lastLog.Term == args.LastLogTerm && len(rf.logs)-1 > args.LastLogIndex) {
 			rf.printLog("Reject the vote of server", args.CandidateID, "because I am more up-to-date.")
@@ -322,6 +321,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 	} else {
+		// same term
+		if rf.status == CANDIDATE {
+			rf.printLog("Receive AppendEntries with the same term. Become follower")
+			rf.votedFor = -1
+			rf.status = FOLLOWER
+		}
+
 		if args.PrevLogIndex >= len(rf.logs) {
 			rf.printLog("args.PrevLogIndex >= len(rf.logs)")
 			reply.Success = false
@@ -368,7 +374,8 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) {
 				rf.leaderStatus.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 				rf.leaderStatus.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 				// update commit
-				for rf.commitIndex < len(rf.logs)-1 {
+				ci := rf.commitIndex
+				for ci < len(rf.logs)-1 {
 					count := 1
 					for server := range rf.peers {
 						if server != rf.me && rf.leaderStatus.matchIndex[server] >= rf.commitIndex+1 {
@@ -378,9 +385,15 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) {
 					if count <= rf.nserver/2 {
 						break
 					}
-					rf.commitIndex++
+					ci++
 				}
-				rf.applyCond.Broadcast()
+
+				// 5.4.2
+				if rf.logs[ci].Term == rf.currentTerm {
+					rf.commitIndex = ci
+					rf.applyCond.Broadcast()
+				}
+
 			} else {
 				// append fail, decrement nextIndex and retry
 				rf.printLog("Append entries to server", server, "failed, decrease nextIndex to", rf.leaderStatus.nextIndex[server]-1)
@@ -496,9 +509,10 @@ func (rf *Raft) heartBeatTimer() {
 
 // check and apply all the message from lastApplied to commitIndex
 func (rf *Raft) checkAndApplyMsg() {
+	applyChBuffer := make(chan ApplyMsg, 100)
 	go func() {
 		for !rf.killed() {
-			rf.applyCh <- <-rf.applyChBuffer
+			rf.applyCh <- <-applyChBuffer
 		}
 	}()
 
@@ -510,7 +524,7 @@ func (rf *Raft) checkAndApplyMsg() {
 			applyMsg.CommandValid = true
 			applyMsg.Command = rf.logs[rf.lastApplied+1].Command
 			applyMsg.CommandIndex = rf.lastApplied + 1
-			rf.applyChBuffer <- applyMsg
+			applyChBuffer <- applyMsg
 			rf.lastApplied++
 			rf.printLog(rf.lastApplied, "command Applied")
 		}
@@ -590,7 +604,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetTimer()
 	rf.commitIndex = 0
 	rf.applyCh = applyCh
-	rf.applyChBuffer = make(chan ApplyMsg, 100)
 	rf.lastApplied = 0
 	rf.nserver = len(rf.peers)
 	rf.status = FOLLOWER
