@@ -18,17 +18,17 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
-
-// import "bytes"
-// import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -51,11 +51,11 @@ const (
 	FOLLOWER = iota
 	CANDIDATE
 	LEADER
-	TimeoutLowerMS      = 500
-	TimeoutUpperMS      = 800
-	HeartBeatIntervalMS = 200
-	LoopCheckIntervalMS = 50
-	enableLog           = true
+	TimeoutLowerMS      = 200
+	TimeoutUpperMS      = 3500
+	HeartBeatIntervalMS = 100
+	LoopCheckIntervalMS = 10
+	enableLog           = false
 )
 
 type leader struct {
@@ -110,7 +110,7 @@ func (rf *Raft) GetState() (int, bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
+// Must be wrapped with lock
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -120,10 +120,18 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
-// restore previously persisted state.
+// restore previously persisted state. Must be wrapped with lock
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -142,6 +150,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		rf.printLog("Init without reading from presist")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+		rf.printLog("Init from presist")
+	}
 }
 
 // ensure lock is wrapped
@@ -161,6 +185,13 @@ func (rf *Raft) printLog(a ...interface{}) {
 		fmt.Print("#", rf.me, " ", statusMap[rf.status], " T", rf.currentTerm, ": ")
 		fmt.Println(a...)
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 //
@@ -197,6 +228,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.status = FOLLOWER
+		rf.persist()
 		rf.printLog("Reveived higer term in sendRequestVote from server", args.CandidateID, "and become Follower")
 	}
 
@@ -213,6 +245,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		} else {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateID
+			rf.persist()
 			rf.resetTimer()
 			rf.printLog("Grant vote to server", args.CandidateID)
 		}
@@ -260,6 +293,7 @@ func (rf *Raft) sendRequestVote(server int, rva *RequestVoteArgs) {
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.status = FOLLOWER
+			rf.persist()
 			rf.printLog("Reveived higer term in sendRequestVote from server", server, ", become Follower")
 		}
 
@@ -295,15 +329,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 
 // AppendEntries receive appendEntries from leader0
@@ -315,6 +344,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.status = FOLLOWER
+		rf.persist()
 		rf.printLog("Reveived higer term in AppendEntries from server", args.LeaderId, ", become Follower")
 	}
 
@@ -326,15 +356,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.printLog("Receive AppendEntries with the same term. Become follower")
 			rf.votedFor = -1
 			rf.status = FOLLOWER
+			rf.persist()
 		}
 
 		if args.PrevLogIndex >= len(rf.logs) {
 			rf.printLog("args.PrevLogIndex >= len(rf.logs)")
 			reply.Success = false
+			reply.ConflictIndex = len(rf.logs)
+			reply.ConflictTerm = -1
 		} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Success = false
+			reply.ConflictTerm = rf.logs[args.PrevLogIndex].Term
+			for reply.ConflictIndex = args.PrevLogIndex; rf.logs[reply.ConflictIndex-1].Term == reply.Term; reply.ConflictIndex-- {
+			}
 			// conflict, remove this entry and all that follow it
 			rf.logs = rf.logs[:args.PrevLogIndex]
+			rf.persist()
 		} else {
 			reply.Success = true
 			// log match at args.PrevLogIndex, ensure the logs after it match args.Entries
@@ -348,6 +385,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					}
 				}
 			}
+			rf.persist()
 			// rf.logs = append(rf.logs, args.Entries...)
 			rf.commitIndex = min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 			rf.applyCond.Broadcast()
@@ -368,40 +406,48 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) {
 			rf.currentTerm = reply.Term
 			rf.status = FOLLOWER
 			rf.votedFor = -1
+			rf.persist()
 			rf.printLog("Reveived higer term in sendRequestVote from server", server, ", become Follower")
 		} else if rf.status == LEADER {
 			if reply.Success == true {
 				rf.leaderStatus.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
 				rf.leaderStatus.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-				// update commit
-				ci := rf.commitIndex
-				for ci < len(rf.logs)-1 {
-					count := 1
-					for server := range rf.peers {
-						if server != rf.me && rf.leaderStatus.matchIndex[server] >= rf.commitIndex+1 {
-							count++
-						}
-					}
-					if count <= rf.nserver/2 {
-						break
-					}
-					ci++
-				}
 
-				// 5.4.2
-				if rf.logs[ci].Term == rf.currentTerm {
+				// update commit
+				indics := make([]int, rf.nserver)
+				copy(indics, rf.leaderStatus.matchIndex)
+				indics[rf.me] = len(rf.logs) - 1
+				sort.Ints(indics)
+				ci := indics[rf.nserver/2]
+
+				// 5.4.2 leader can only update commitIndex to current term
+				if ci > rf.commitIndex && rf.logs[ci].Term == rf.currentTerm {
 					rf.commitIndex = ci
 					rf.applyCond.Broadcast()
 				}
 
 			} else {
-				// append fail, decrement nextIndex and retry
-				rf.printLog("Append entries to server", server, "failed, decrease nextIndex to", rf.leaderStatus.nextIndex[server]-1)
-				rf.leaderStatus.nextIndex[server]--
+				// append failed, decrement nextIndex and retry
+				if reply.ConflictTerm >= 0 {
+					index := -1
+					for i, log := range rf.logs {
+						if log.Term == reply.ConflictTerm {
+							index = i
+						}
+					}
+					if index != -1 {
+						rf.leaderStatus.nextIndex[server] = index + 1
+					} else {
+						rf.leaderStatus.nextIndex[server] = reply.ConflictIndex
+					}
+				} else {
+					rf.leaderStatus.nextIndex[server] = reply.ConflictIndex
+				}
+				rf.printLog("Append entries to server", server, "failed, decrease nextIndex to", rf.leaderStatus.nextIndex[server])
 				rf.issueAppendEntry(server)
 			}
 		} else {
-			rf.printLog("Receive AppendEntries from", server, "but it's too late.")
+			rf.printLog("Receive AppendEntries reply from", server, "but I am now leader now.")
 		}
 
 		rf.mu.Unlock()
@@ -437,6 +483,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = true
 
 		rf.logs = append(rf.logs, LogEntry{rf.currentTerm, command})
+		rf.persist()
 		rf.issueAppendEntriesAll()
 	}
 
@@ -484,6 +531,7 @@ func (rf *Raft) electionTimer() {
 				rva.CandidateID = rf.me
 				rva.LastLogIndex = len(rf.logs) - 1
 				rva.LastLogTerm = rf.logs[rva.LastLogIndex].Term
+				rf.persist()
 				for server := range rf.peers {
 					if server != rf.me {
 						go rf.sendRequestVote(server, rva)
@@ -509,12 +557,6 @@ func (rf *Raft) heartBeatTimer() {
 
 // check and apply all the message from lastApplied to commitIndex
 func (rf *Raft) checkAndApplyMsg() {
-	applyChBuffer := make(chan ApplyMsg, 100)
-	go func() {
-		for !rf.killed() {
-			rf.applyCh <- <-applyChBuffer
-		}
-	}()
 
 	rf.mu.Lock()
 	for !rf.killed() {
@@ -524,7 +566,7 @@ func (rf *Raft) checkAndApplyMsg() {
 			applyMsg.CommandValid = true
 			applyMsg.Command = rf.logs[rf.lastApplied+1].Command
 			applyMsg.CommandIndex = rf.lastApplied + 1
-			applyChBuffer <- applyMsg
+			rf.applyCh <- applyMsg
 			rf.lastApplied++
 			rf.printLog(rf.lastApplied, "command Applied")
 		}
@@ -543,6 +585,7 @@ func (rf *Raft) issueAppendEntriesAll() {
 	}
 }
 
+// ensure lock is wrapped
 func (rf *Raft) issueAppendEntry(server int) {
 	if rf.status == LEADER {
 		aea := &AppendEntriesArgs{}
@@ -558,23 +601,6 @@ func (rf *Raft) issueAppendEntry(server int) {
 		go rf.SendAppendEntries(server, aea)
 	}
 }
-
-// // ensure lock is wrapped
-// func (rf *Raft) sendHeartBeats() {
-// 	// rf.printLog("Send heart beats to other servers")
-// 	aea := AppendEntriesArgs{}
-// 	aea.Term = rf.currentTerm
-// 	aea.PrevLogIndex = len(rf.logs) - 1
-// 	aea.PrevLogTerm = rf.logs[aea.PrevLogIndex].Term
-// 	aea.LeaderId = rf.me
-// 	aea.LeaderCommit = rf.commitIndex
-
-// 	for server := range rf.peers {
-// 		if server != rf.me {
-// 			go rf.SendAppendEntries(server, aea)
-// 		}
-// 	}
-// }
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -613,6 +639,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// }
 	rf.leaderStatus.matchIndex = make([]int, rf.nserver)
 
+	rf.mu.Lock()
 	// check and apply message between applied and commitIndex in the background
 	go rf.checkAndApplyMsg()
 
@@ -624,6 +651,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Unlock()
 
 	return rf
 }
