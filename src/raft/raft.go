@@ -44,7 +44,7 @@ const (
 	TimeoutLowerMS      = 250
 	TimeoutUpperMS      = 400
 	HeartBeatIntervalMS = 100
-	LoopCheckIntervalMS = 50
+	LoopCheckIntervalMS = 10
 	RetryRPCIntervalMS  = 50
 	enableLog           = false
 )
@@ -460,7 +460,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.printLog("Start command")
+	rf.printLog("Start command", command)
 	if rf.status == LEADER {
 		index = len(rf.logs) - rf.numNil
 		term = rf.currentTerm
