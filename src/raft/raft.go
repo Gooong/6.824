@@ -38,13 +38,12 @@ type ApplyMsg struct {
 }
 
 const (
-	FOLLOWER            = iota //0
-	CANDIDATE                  //1
-	LEADER                     //2
-	TimeoutLowerMS      = 250
-	TimeoutUpperMS      = 400
-	HeartBeatIntervalMS = 100
-	LoopCheckIntervalMS = 10
+	FOLLOWER            = iota // 0
+	CANDIDATE                  // 1
+	LEADER                     // 2
+	TimeoutLowerMS      = 450
+	TimeoutUpperMS      = 600
+	HeartBeatIntervalMS = 200
 	RetryRPCIntervalMS  = 50
 	enableLog           = false
 )
@@ -85,8 +84,7 @@ type Raft struct {
 	numNil       int // num of nil command
 
 	// for election timer
-	lastTime        time.Time
-	timeoutInterval time.Duration
+	heartBeatCh	chan struct{}
 }
 
 // GetState return currentTerm and whether this server
@@ -135,10 +133,11 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-// Update last time of heartbeat. Ensure lock is wrapped
+// Update last time of heartbeat
 func (rf *Raft) resetTimer() {
-	rf.lastTime = time.Now()
-	rf.timeoutInterval = (time.Duration(rand.Int31()%(TimeoutUpperMS-TimeoutLowerMS) + TimeoutLowerMS)) * time.Millisecond
+	go func(){
+		rf.heartBeatCh <- struct{}{}
+	}()
 }
 
 func (rf *Raft) printLog(a ...interface{}) {
@@ -500,10 +499,19 @@ func (rf *Raft) killed() bool {
 
 // set and check election timeout
 func (rf *Raft) electionLoop() {
+	localRand := rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
+	getRandInterval := func() time.Duration{
+		return (time.Duration(localRand.Int31()%(TimeoutUpperMS-TimeoutLowerMS) + TimeoutLowerMS)) * time.Millisecond
+	}
+	timer := time.NewTimer(getRandInterval())
 	for !rf.killed() {
-		time.Sleep(LoopCheckIntervalMS * time.Millisecond)
-		rf.mu.Lock()
-		if time.Now().Sub(rf.lastTime) > rf.timeoutInterval {
+		select {
+		case <- rf.heartBeatCh:
+			if !timer.Stop() {
+                <-timer.C
+            }
+		case <- timer.C:
+			rf.mu.Lock()
 			if rf.status == FOLLOWER || rf.status == CANDIDATE {
 				rf.printLog("Timeout, triger next election")
 				rf.becomeCandidate()
@@ -519,10 +527,10 @@ func (rf *Raft) electionLoop() {
 						go rf.sendRequestVote(server, rva)
 					}
 				}
-				rf.resetTimer()
 			}
+			rf.mu.Unlock()
 		}
-		rf.mu.Unlock()
+		timer.Reset(getRandInterval())
 	}
 }
 
@@ -594,7 +602,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.status = FOLLOWER
 	rf.leaderStatus.nextIndex = make([]int, len(rf.peers))
 	rf.leaderStatus.matchIndex = make([]int, len(rf.peers))
-
+	rf.heartBeatCh = make(chan struct{}, 100)
 	rf.mu.Lock()
 	// check and apply message between applied and commitIndex in the background
 	go rf.applyLoop()
@@ -603,7 +611,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.heartBeatLoop()
 
 	// follower periodically timeout
-	rf.resetTimer()
 	go rf.electionLoop()
 
 	// initialize from state persisted before a crash
