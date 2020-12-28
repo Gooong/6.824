@@ -41,9 +41,9 @@ const (
 	FOLLOWER            = iota // 0
 	CANDIDATE                  // 1
 	LEADER                     // 2
-	TimeoutLowerMS      = 450
-	TimeoutUpperMS      = 600
-	HeartBeatIntervalMS = 200
+	TimeoutLowerMS      = 250
+	TimeoutUpperMS      = 400
+	HeartBeatIntervalMS = 100 // set to 100 to avoid TestFigure8Unreliable2C fails
 	RetryRPCIntervalMS  = 50
 	enableLog           = false
 )
@@ -434,7 +434,8 @@ func (rf *Raft) becomeLeader() {
 		rf.leaderStatus.matchIndex[server] = 0
 		rf.leaderStatus.nextIndex[server] = len(rf.logs)
 	}
-	go rf.Start(nil)
+	rf.issueAppendEntriesAll()
+	// go rf.Start(nil)
 }
 
 //
@@ -459,7 +460,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.printLog("Start command", command)
+
 	if rf.status == LEADER {
 		index = len(rf.logs) - rf.numNil
 		term = rf.currentTerm
@@ -469,7 +470,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		rf.issueAppendEntriesAll()
 	}
-
+	rf.printLog("Start command", command, index, term, isLeader)
 	return index, term, isLeader
 }
 
@@ -554,10 +555,10 @@ func (rf *Raft) applyLoop() {
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 
-			if rf.logs[rf.lastApplied].Command == nil {
-				rf.numNil++
-				continue
-			}
+			// if rf.logs[rf.lastApplied].Command == nil {
+			// 	rf.numNil++
+			// 	continue
+			// }
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.logs[rf.lastApplied].Command,
